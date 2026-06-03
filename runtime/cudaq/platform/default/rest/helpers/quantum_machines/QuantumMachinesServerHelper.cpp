@@ -6,6 +6,7 @@
  * the terms of the Apache License 2.0 which accompanies this distribution.    *
  ******************************************************************************/
 
+#include "common/ExtraPayloadProvider.h"
 #include "common/RestClient.h"
 #include "common/ServerHelper.h"
 #include "cudaq/Support/Version.h"
@@ -22,6 +23,11 @@
 #include <unordered_set>
 
 using json = nlohmann::json;
+
+namespace {
+constexpr const char *decoderConfigPayloadType = "gpu_decoder_config";
+constexpr const char *decoderConfigJobJsonPath = "/decoder_config";
+} // namespace
 
 namespace cudaq {
 
@@ -123,6 +129,26 @@ public:
     job["executor"] = backendConfig["executor"];
     job["disable-qubit-mapping"] = disableQubitMapping;
     job["output_format"] = isRunRequest ? "qir-raw" : "histogram";
+    const auto providerConfig =
+        runtimeTarget.runtimeConfig.find("extra_payload_provider");
+    if (providerConfig != runtimeTarget.runtimeConfig.end()) {
+      cudaq::ExtraPayloadProvider *extraPayloadProvider = nullptr;
+      for (const auto &provider : cudaq::getExtraPayloadProviders()) {
+        if (provider->name() == providerConfig->second) {
+          extraPayloadProvider = provider.get();
+          break;
+        }
+      }
+      if (!extraPayloadProvider)
+        throw std::runtime_error("ExtraPayloadProvider with name " +
+                                 providerConfig->second + " not found.");
+      if (extraPayloadProvider->getPayloadType() != decoderConfigPayloadType)
+        throw std::runtime_error("Invalid extra payload provider type '" +
+                                 extraPayloadProvider->getPayloadType() +
+                                 "'. This is not supported on this target.");
+      job[json::json_pointer(decoderConfigJobJsonPath)] =
+          extraPayloadProvider->getExtraPayload(runtimeTarget);
+    }
     RestHeaders headers = getHeaders();
     std::string path = backendConfig["url"] + "/v1/execute";
     return std::make_tuple(path, headers, std::vector<ServerMessage>{job});

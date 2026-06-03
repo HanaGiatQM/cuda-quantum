@@ -46,4 +46,9 @@ target-arguments:
     type: string
     platform-arg: api_key
     help-string: "An API key to access the Qoperator server"
+  - key: extra-payload-provider
+    required: false
+    type: string
+    platform-arg: extra_payload_provider
+    help-string: "Specify the extra payload provider if any."
   
