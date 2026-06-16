@@ -217,6 +217,14 @@ private:
           for (auto iter : llvm::enumerate(cont.getOperands()))
             if (cudaq::quake::isLinearType(iter.value().getType()))
               insertToEqClass(ccif.getResult(iter.index()), iter.value());
+        } else if (isa<cudaq::cc::LoopOp>(parent)) {
+          if (llvm::any_of(cont.getOperands(), [](Value v) {
+                return cudaq::quake::isQuantumValueType(v.getType());
+              })) {
+            // TODO: handle loop-carried quantum values through cc::LoopOp.
+            analysisFailed = true;
+            return;
+          }
         } else if (isa<cudaq::cc::ScopeOp>(parent)) {
           if (llvm::any_of(cont.getOperands(), [](Value v) {
                 return cudaq::quake::isQuantumValueType(v.getType());
@@ -225,7 +233,6 @@ private:
             return;
           }
         } else {
-          // TODO: handle cc::LoopOp.
           analysisFailed = true;
           return;
         }

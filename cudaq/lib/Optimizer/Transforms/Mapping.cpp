@@ -6,7 +6,10 @@
  * the terms of the Apache License 2.0 which accompanies this distribution.    *
  ******************************************************************************/
 
+#include "LoopAnalysis.h"
 #include "PassDetails.h"
+#include "cudaq/Optimizer/Dialect/CC/CCOps.h"
+#include "cudaq/Optimizer/Dialect/Quake/QuakeOps.h"
 #include "cudaq/Optimizer/Transforms/Passes.h"
 #include "cudaq/Support/Device.h"
 #include "cudaq/Support/Placement.h"
@@ -15,7 +18,9 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Matchers.h"
 
 namespace cudaq::opt {
 #define GEN_PASS_DEF_MAPPINGFUNC
@@ -619,6 +624,454 @@ struct MappingFunc : public cudaq::opt::impl::MappingFuncBase<MappingFunc> {
       addOpAndUsersToList(user, opsToMoveToEnd);
   }
 
+  std::optional<unsigned> getStaticReferenceQubitCount(func::FuncOp func) {
+    unsigned numQubits = 0;
+    bool failed = false;
+    func.walk([&](cudaq::quake::AllocaOp alloca) {
+      if (alloca->getParentOp() != func) {
+        failed = true;
+        return WalkResult::interrupt();
+      }
+      auto ty = alloca.getResult().getType();
+      if (!cudaq::quake::isConstantQuantumRefType(ty)) {
+        failed = true;
+        return WalkResult::interrupt();
+      }
+      numQubits += cudaq::quake::getAllocationSize(ty);
+      return WalkResult::advance();
+    });
+    if (failed)
+      return std::nullopt;
+    return numQubits;
+  }
+
+  std::optional<unsigned> getSingleReferenceOperandCount(ValueRange values) {
+    unsigned count = 0;
+    for (auto value : values) {
+      auto type = value.getType();
+      if (isa<cudaq::quake::RefType, cudaq::quake::WireType,
+              cudaq::quake::ControlType>(type)) {
+        ++count;
+        continue;
+      }
+      if (cudaq::quake::isQuantumType(type))
+        return std::nullopt;
+    }
+    return count;
+  }
+
+  std::optional<unsigned> getMeasurementOperandCount(ValueRange values) {
+    unsigned count = 0;
+    for (auto value : values) {
+      auto type = value.getType();
+      if (isa<cudaq::quake::RefType, cudaq::quake::WireType,
+              cudaq::quake::ControlType>(type)) {
+        ++count;
+        continue;
+      }
+      if (auto veqTy = dyn_cast<cudaq::quake::VeqType>(type)) {
+        if (!veqTy.hasSpecifiedSize())
+          return std::nullopt;
+        count += veqTy.getSize();
+        continue;
+      }
+      if (cudaq::quake::isQuantumType(type))
+        return std::nullopt;
+    }
+    return count;
+  }
+
+  bool isAllowedReferenceMappingScaffold(Operation *op) {
+    return isa<cudaq::quake::AllocaOp, cudaq::quake::ConcatOp,
+               cudaq::quake::DeallocOp, cudaq::quake::DiscriminateOp,
+               cudaq::quake::ExtractRefOp, cudaq::quake::ReturnWireOp,
+               cudaq::quake::SinkOp, cudaq::quake::UnwrapOp,
+               cudaq::quake::WrapOp>(op);
+  }
+
+  void setIdentityMappingAttrs(func::FuncOp func, unsigned numQubits,
+                               unsigned numMeasurements) {
+    Builder builder(func.getContext());
+
+    SmallVector<Attribute> v2p(numQubits);
+    for (unsigned i = 0; i < numQubits; ++i)
+      v2p[i] = builder.getI64IntegerAttr(i);
+    func->setAttr("mapping_v2p", builder.getArrayAttr(v2p));
+
+    SmallVector<Attribute> reorder(numMeasurements);
+    for (unsigned i = 0; i < numMeasurements; ++i)
+      reorder[i] = builder.getI64IntegerAttr(i);
+    func->setAttr("mapping_reorder_idx", builder.getArrayAttr(reorder));
+  }
+
+  struct AffineIndex {
+    Value base;
+    int64_t offset = 0;
+    Type originalType;
+    Type extractedType;
+  };
+
+  struct ReferenceAccess {
+    Value ref;
+    Value veq;
+    AffineIndex index;
+  };
+
+  struct IndexRange {
+    int64_t min;
+    int64_t max;
+  };
+
+  std::optional<int64_t> getConstantInt(Value value) {
+    APInt constant;
+    if (matchPattern(value, m_ConstantInt(&constant)))
+      return constant.getSExtValue();
+    return std::nullopt;
+  }
+
+  std::optional<AffineIndex> getAffineIndex(Value value, Type extractedType) {
+    if (auto constant = getConstantInt(value))
+      return AffineIndex{Value{}, *constant, value.getType(), extractedType};
+
+    if (auto cast = value.getDefiningOp<cudaq::cc::CastOp>())
+      if (auto inner = getAffineIndex(cast.getValue(), value.getType())) {
+        inner->extractedType = value.getType();
+        return inner;
+      }
+
+    if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+      if (auto rhs = getConstantInt(add.getRhs()))
+        if (auto lhs = getAffineIndex(add.getLhs(), value.getType())) {
+          lhs->offset += *rhs;
+          lhs->originalType = value.getType();
+          return lhs;
+        }
+      if (auto lhs = getConstantInt(add.getLhs()))
+        if (auto rhs = getAffineIndex(add.getRhs(), value.getType())) {
+          rhs->offset += *lhs;
+          rhs->originalType = value.getType();
+          return rhs;
+        }
+    }
+
+    if (isa<IntegerType, IndexType>(value.getType()))
+      return AffineIndex{value, 0, value.getType(), extractedType};
+    return std::nullopt;
+  }
+
+  std::optional<ReferenceAccess>
+  getReferenceAccess(Value ref, const DenseMap<Value, unsigned> &staticRefs) {
+    if (auto iter = staticRefs.find(ref); iter != staticRefs.end())
+      return ReferenceAccess{ref, Value{},
+                             AffineIndex{Value{},
+                                         static_cast<int64_t>(iter->second),
+                                         Type{}, Type{}}};
+
+    auto extract = ref.getDefiningOp<cudaq::quake::ExtractRefOp>();
+    if (!extract)
+      return std::nullopt;
+
+    auto concat = extract.getVeq().getDefiningOp<cudaq::quake::ConcatOp>();
+    if (!concat)
+      return std::nullopt;
+    for (auto target : concat.getTargets())
+      if (!isa<cudaq::quake::RefType>(target.getType()))
+        return std::nullopt;
+
+    AffineIndex index;
+    if (extract.hasConstantIndex()) {
+      index =
+          AffineIndex{Value{}, static_cast<int64_t>(extract.getConstantIndex()),
+                      Type{}, Type{}};
+    } else {
+      auto parsed =
+          getAffineIndex(extract.getIndex(), extract.getIndex().getType());
+      if (!parsed)
+        return std::nullopt;
+      index = *parsed;
+    }
+    return ReferenceAccess{ref, extract.getVeq(), index};
+  }
+
+  std::optional<int64_t> getConstantDistance(const ReferenceAccess &from,
+                                             const ReferenceAccess &to) {
+    if (from.veq != to.veq)
+      return std::nullopt;
+    if (from.index.base != to.index.base)
+      return std::nullopt;
+    return to.index.offset - from.index.offset;
+  }
+
+  std::optional<IndexRange> getLoopInductionRange(Value base) {
+    auto arg = dyn_cast<BlockArgument>(base);
+    if (!arg)
+      return std::nullopt;
+
+    auto loop =
+        dyn_cast_or_null<cudaq::cc::LoopOp>(arg.getOwner()->getParentOp());
+    if (!loop || arg.getOwner()->getParent() != &loop.getBodyRegion())
+      return std::nullopt;
+
+    cudaq::opt::LoopComponents components;
+    if (!cudaq::opt::isaMonotonicLoop(loop.getOperation(),
+                                      /*allowEarlyExit=*/false, &components))
+      return std::nullopt;
+    if (arg.getArgNumber() != components.induction)
+      return std::nullopt;
+
+    auto iterations = components.getIterationsConstant();
+    auto initial = getConstantInt(components.initialValue);
+    auto step = getConstantInt(components.stepValue);
+    if (!iterations || *iterations == 0 || !initial || !step)
+      return std::nullopt;
+    if (!components.stepIsAnAddOp())
+      *step = -*step;
+
+    auto last = *initial + static_cast<int64_t>(*iterations - 1) * *step;
+    return IndexRange{std::min(*initial, last), std::max(*initial, last)};
+  }
+
+  std::optional<IndexRange>
+  getReferenceIndexRange(const ReferenceAccess &access, unsigned numQubits) {
+    IndexRange range;
+    if (access.index.base) {
+      auto baseRange = getLoopInductionRange(access.index.base);
+      if (!baseRange)
+        return std::nullopt;
+      range = {baseRange->min + access.index.offset,
+               baseRange->max + access.index.offset};
+    } else {
+      range = {access.index.offset, access.index.offset};
+    }
+
+    if (range.min < 0 || range.max >= static_cast<int64_t>(numQubits))
+      return std::nullopt;
+    return range;
+  }
+
+  bool isLinearRouteSupported(const cudaq::Device &device,
+                              IndexRange routeRange) {
+    if (routeRange.min < 0 ||
+        routeRange.max >= static_cast<int64_t>(device.getNumQubits()))
+      return false;
+
+    for (auto index = routeRange.min; index < routeRange.max; ++index)
+      if (!device.areConnected(
+              cudaq::Device::Qubit(static_cast<unsigned>(index)),
+              cudaq::Device::Qubit(static_cast<unsigned>(index + 1))))
+        return false;
+    return true;
+  }
+
+  Value createIndexValue(OpBuilder &builder, Location loc,
+                         const AffineIndex &baseIndex, int64_t offset) {
+    if (!baseIndex.base)
+      return Value{};
+
+    Value index = baseIndex.base;
+    if (offset != 0) {
+      Value constant =
+          isa<IndexType>(index.getType())
+              ? Value(arith::ConstantIndexOp::create(builder, loc, offset))
+              : Value(arith::ConstantIntOp::create(
+                    builder, loc, cast<IntegerType>(index.getType()), offset));
+      index = arith::AddIOp::create(builder, loc, index, constant);
+    }
+
+    if (baseIndex.extractedType && index.getType() != baseIndex.extractedType)
+      index = cudaq::cc::CastOp::create(builder, loc, baseIndex.extractedType,
+                                        index, cudaq::cc::CastOpMode::Signed);
+    return index;
+  }
+
+  Value createReferenceAt(OpBuilder &builder, Location loc,
+                          const ReferenceAccess &anchor, int64_t offset) {
+    if (!anchor.veq)
+      return Value{};
+
+    if (!anchor.index.base)
+      return cudaq::quake::ExtractRefOp::create(
+          builder, loc, anchor.veq, static_cast<std::size_t>(offset));
+
+    auto index = createIndexValue(builder, loc, anchor.index, offset);
+    if (!index)
+      return Value{};
+    return cudaq::quake::ExtractRefOp::create(builder, loc, anchor.veq, index);
+  }
+
+  cudaq::quake::WrapOp findWrap(Value wire) {
+    for (auto *user : wire.getUsers())
+      if (auto wrap = dyn_cast<cudaq::quake::WrapOp>(user))
+        return wrap;
+    return {};
+  }
+
+  LogicalResult
+  routeReferenceQlsTwoQubitOp(Operation *op, const cudaq::Device &device,
+                              const DenseMap<Value, unsigned> &staticRefs,
+                              unsigned numQubits) {
+    auto operands = cudaq::quake::getQuantumOperands(op);
+    auto results = cudaq::quake::getQuantumResults(op);
+    if (operands.size() != 2 || results.size() != 2)
+      return failure();
+
+    auto lhsUnwrap = operands[0].getDefiningOp<cudaq::quake::UnwrapOp>();
+    auto rhsUnwrap = operands[1].getDefiningOp<cudaq::quake::UnwrapOp>();
+    if (!lhsUnwrap || !rhsUnwrap)
+      return failure();
+
+    auto lhsAccess = getReferenceAccess(lhsUnwrap.getRefValue(), staticRefs);
+    auto rhsAccess = getReferenceAccess(rhsUnwrap.getRefValue(), staticRefs);
+    if (!lhsAccess || !rhsAccess)
+      return failure();
+
+    auto distance = getConstantDistance(*lhsAccess, *rhsAccess);
+    if (!distance)
+      return failure();
+    if (*distance == 0)
+      return failure();
+    auto absDistance = static_cast<unsigned>(std::llabs(*distance));
+
+    if (!lhsAccess->index.base) {
+      auto lhsQ = cudaq::Device::Qubit(lhsAccess->index.offset);
+      auto rhsQ = cudaq::Device::Qubit(rhsAccess->index.offset);
+      if (device.areConnected(lhsQ, rhsQ))
+        return success();
+    }
+
+    auto lhsRange = getReferenceIndexRange(*lhsAccess, numQubits);
+    auto rhsRange = getReferenceIndexRange(*rhsAccess, numQubits);
+    if (!lhsRange || !rhsRange)
+      return failure();
+
+    IndexRange routeRange{std::min(lhsRange->min, rhsRange->min),
+                          std::max(lhsRange->max, rhsRange->max)};
+    if (!isLinearRouteSupported(device, routeRange))
+      return failure();
+    if (absDistance == 1)
+      return success();
+
+    SmallVector<Value> refs(absDistance + 1);
+    SmallVector<Value> wires(absDistance + 1);
+    refs[0] = lhsAccess->ref;
+    refs[absDistance] = rhsAccess->ref;
+    wires[0] = operands[0];
+    wires[absDistance] = operands[1];
+
+    auto loc = op->getLoc();
+    OpBuilder beforeBuilder(op);
+    auto sign = *distance > 0 ? 1 : -1;
+    for (unsigned i = 1; i < absDistance; ++i) {
+      refs[i] = createReferenceAt(beforeBuilder, loc, *lhsAccess,
+                                  lhsAccess->index.offset + sign * i);
+      if (!refs[i])
+        return failure();
+      wires[i] = cudaq::quake::UnwrapOp::create(beforeBuilder, loc,
+                                                operands[0].getType(), refs[i]);
+    }
+
+    auto wireType = operands[0].getType();
+    for (unsigned i = absDistance - 1; i > 0; --i) {
+      auto swap = cudaq::quake::SwapOp::create(
+          beforeBuilder, loc, TypeRange{wireType, wireType}, false,
+          ValueRange{}, ValueRange{}, ValueRange{wires[i], wires[i + 1]},
+          DenseBoolArrayAttr{});
+      wires[i] = swap.getResult(0);
+      wires[i + 1] = swap.getResult(1);
+    }
+
+    if (failed(cudaq::quake::setQuantumOperands(op, {wires[0], wires[1]})))
+      return failure();
+    wires[0] = results[0];
+    wires[1] = results[1];
+
+    OpBuilder afterBuilder(op->getContext());
+    afterBuilder.setInsertionPointAfter(op);
+    for (unsigned i = 1; i < absDistance; ++i) {
+      auto swap = cudaq::quake::SwapOp::create(
+          afterBuilder, loc, TypeRange{wireType, wireType}, false, ValueRange{},
+          ValueRange{}, ValueRange{wires[i], wires[i + 1]},
+          DenseBoolArrayAttr{});
+      wires[i] = swap.getResult(0);
+      wires[i + 1] = swap.getResult(1);
+    }
+
+    auto lhsWrap = findWrap(results[0]);
+    auto rhsWrap = findWrap(results[1]);
+    if (!lhsWrap || !rhsWrap)
+      return failure();
+    lhsWrap.getWireValueMutable().assign(wires[0]);
+    rhsWrap.getWireValueMutable().assign(wires[absDistance]);
+    for (unsigned i = 1; i < absDistance; ++i)
+      cudaq::quake::WrapOp::create(afterBuilder, loc, wires[i], refs[i]);
+
+    return success();
+  }
+
+  LogicalResult tryReferenceQlsMapping(func::FuncOp func,
+                                       const cudaq::Device &device) {
+    auto numQubits = getStaticReferenceQubitCount(func);
+    if (!numQubits)
+      return failure();
+
+    DenseMap<Value, unsigned> staticRefs;
+    unsigned refIndex = 0;
+    func.walk([&](cudaq::quake::AllocaOp alloca) {
+      staticRefs[alloca.getResult()] = refIndex++;
+    });
+
+    bool hasQuantum = false;
+    unsigned numMeasurements = 0;
+    auto walkResult = func.walk([&](Operation *op) {
+      if (isa<cudaq::quake::NullWireOp>(op))
+        return WalkResult::interrupt();
+
+      if (auto gate = dyn_cast<cudaq::quake::OperatorInterface>(op)) {
+        hasQuantum = true;
+        auto controlCount = getSingleReferenceOperandCount(gate.getControls());
+        auto targetCount = getSingleReferenceOperandCount(gate.getTargets());
+        if (!controlCount || !targetCount)
+          return WalkResult::interrupt();
+        auto totalCount = *controlCount + *targetCount;
+        if (totalCount > 2)
+          return WalkResult::interrupt();
+        if (totalCount == 2 && failed(routeReferenceQlsTwoQubitOp(
+                                   op, device, staticRefs, *numQubits)))
+          return WalkResult::interrupt();
+        return WalkResult::advance();
+      }
+
+      if (auto meas = dyn_cast<cudaq::quake::MeasurementInterface>(op)) {
+        hasQuantum = true;
+        auto count = getMeasurementOperandCount(meas.getTargets());
+        if (!count)
+          return WalkResult::interrupt();
+        numMeasurements += *count;
+        return WalkResult::advance();
+      }
+
+      if (isAllowedReferenceMappingScaffold(op)) {
+        hasQuantum = true;
+        return WalkResult::advance();
+      }
+
+      if (op->getName().getStringRef().starts_with("quake."))
+        return WalkResult::interrupt();
+
+      return WalkResult::advance();
+    });
+
+    if (walkResult.wasInterrupted())
+      return failure();
+    if (!hasQuantum)
+      return failure();
+    if (*numQubits == 0 || *numQubits > device.getNumQubits())
+      return failure();
+
+    setIdentityMappingAttrs(func, *numQubits, numMeasurements);
+    return success();
+  }
+
   void runOnOperation() override {
     if (deviceBypass)
       return;
@@ -680,6 +1133,10 @@ struct MappingFunc : public cudaq::opt::impl::MappingFuncBase<MappingFunc> {
       return;
     }
     if (!highestIdentity) {
+      if (deviceInstance->getNumQubits() != 0 &&
+          succeeded(tryReferenceQlsMapping(func, *deviceInstance)))
+        return;
+
       if (nonComposable) {
         func.emitOpError("no borrow_wire ops found in " + func.getName());
         signalPassFailure();
