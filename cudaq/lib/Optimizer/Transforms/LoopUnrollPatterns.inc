@@ -6,11 +6,13 @@
  * the terms of the Apache License 2.0 which accompanies this distribution.    *
  ******************************************************************************/
 
-// These patterns are used by classical-optimization pass and cc-loop-unroll
-// pass.
+// These patterns are used by classical-optimization pass, cc-loop-unroll pass,
+// and mapping-specific selective unrolling.
 
 // This file must be included after a `using namespace mlir;` as it uses bare
 // identifiers from that namespace.
+
+#include <functional>
 
 inline std::pair<Block *, Block *> findCloneRange(Block *first, Block *last) {
   return {first->getNextNode(), last->getPrevNode()};
@@ -54,13 +56,17 @@ namespace {
 /// invariant. An invariant loop means the loop must execute exactly some
 /// specific number of times, even if that number is only known at runtime.
 struct UnrollCountedLoop : public OpRewritePattern<cudaq::cc::LoopOp> {
-  explicit UnrollCountedLoop(MLIRContext *ctx, std::size_t t, bool sf, bool ab,
-                             unsigned &p)
+  explicit UnrollCountedLoop(
+      MLIRContext *ctx, std::size_t t, bool sf, bool ab, unsigned &p,
+      std::function<bool(cudaq::cc::LoopOp)> filter = nullptr)
       : OpRewritePattern(ctx), threshold(t), signalFailure(sf), allowBreak(ab),
-        progress(p) {}
+        progress(p), filter(std::move(filter)) {}
 
   LogicalResult matchAndRewrite(cudaq::cc::LoopOp loop,
                                 PatternRewriter &rewriter) const override {
+    if (filter && !filter(loop))
+      return failure();
+
     // When the signalFailure flag is set, all loops are matched since that flag
     // requires that all LoopOp operations be rewritten. Despite the setting of
     // this flag, it may not be possible to fully unroll every LoopOp anyway.
@@ -212,5 +218,6 @@ struct UnrollCountedLoop : public OpRewritePattern<cudaq::cc::LoopOp> {
   bool signalFailure;
   bool allowBreak;
   unsigned &progress;
+  std::function<bool(cudaq::cc::LoopOp)> filter;
 };
 } // namespace
