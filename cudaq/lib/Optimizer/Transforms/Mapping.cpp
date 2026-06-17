@@ -13,14 +13,20 @@
 #include "cudaq/Optimizer/Transforms/Passes.h"
 #include "cudaq/Support/Device.h"
 #include "cudaq/Support/Placement.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+
+#include <algorithm>
 
 namespace cudaq::opt {
 #define GEN_PASS_DEF_MAPPINGFUNC
@@ -31,6 +37,8 @@ namespace cudaq::opt {
 #define DEBUG_TYPE "quantum-mapper"
 
 using namespace mlir;
+
+#include "LoopUnrollPatterns.inc"
 
 namespace {
 
@@ -771,12 +779,17 @@ struct MappingFunc : public cudaq::opt::impl::MappingFuncBase<MappingFunc> {
     if (!extract)
       return std::nullopt;
 
-    auto concat = extract.getVeq().getDefiningOp<cudaq::quake::ConcatOp>();
-    if (!concat)
-      return std::nullopt;
-    for (auto target : concat.getTargets())
-      if (!isa<cudaq::quake::RefType>(target.getType()))
+    if (auto concat =
+            extract.getVeq().getDefiningOp<cudaq::quake::ConcatOp>()) {
+      for (auto target : concat.getTargets())
+        if (!isa<cudaq::quake::RefType>(target.getType()))
+          return std::nullopt;
+    } else {
+      auto veqType =
+          dyn_cast<cudaq::quake::VeqType>(extract.getVeq().getType());
+      if (!veqType || !veqType.hasSpecifiedSize())
         return std::nullopt;
+    }
 
     AffineIndex index;
     if (extract.hasConstantIndex()) {
@@ -831,6 +844,28 @@ struct MappingFunc : public cudaq::opt::impl::MappingFuncBase<MappingFunc> {
     return IndexRange{std::min(*initial, last), std::max(*initial, last)};
   }
 
+  cudaq::cc::LoopOp getStaticLoopInductionOwner(Value base) {
+    auto arg = dyn_cast<BlockArgument>(base);
+    if (!arg)
+      return {};
+
+    auto loop =
+        dyn_cast_or_null<cudaq::cc::LoopOp>(arg.getOwner()->getParentOp());
+    if (!loop || arg.getOwner()->getParent() != &loop.getBodyRegion())
+      return {};
+
+    cudaq::opt::LoopComponents components;
+    if (!cudaq::opt::isaMonotonicLoop(loop.getOperation(),
+                                      /*allowEarlyExit=*/false, &components))
+      return {};
+    if (arg.getArgNumber() != components.induction)
+      return {};
+    if (!components.getIterationsConstant())
+      return {};
+
+    return loop;
+  }
+
   std::optional<IndexRange>
   getReferenceIndexRange(const ReferenceAccess &access, unsigned numQubits) {
     IndexRange range;
@@ -861,6 +896,44 @@ struct MappingFunc : public cudaq::opt::impl::MappingFuncBase<MappingFunc> {
               cudaq::Device::Qubit(static_cast<unsigned>(index + 1))))
         return false;
     return true;
+  }
+
+  std::optional<SmallVector<cudaq::Device::Qubit>>
+  getShortestDevicePath(const cudaq::Device &device, cudaq::Device::Qubit src,
+                        cudaq::Device::Qubit dst) {
+    auto numQubits = device.getNumQubits();
+    if (src.index >= numQubits || dst.index >= numQubits)
+      return std::nullopt;
+
+    SmallVector<int64_t> parent(numQubits, -1);
+    SmallVector<cudaq::Device::Qubit> queue;
+    queue.reserve(numQubits);
+    parent[src.index] = src.index;
+    queue.push_back(src);
+
+    for (std::size_t begin = 0; begin < queue.size(); ++begin) {
+      auto node = queue[begin];
+      if (node == dst)
+        break;
+      for (auto neighbour : device.getNeighbours(node)) {
+        if (neighbour.index >= numQubits || parent[neighbour.index] != -1)
+          continue;
+        parent[neighbour.index] = node.index;
+        queue.push_back(neighbour);
+      }
+    }
+
+    if (parent[dst.index] == -1)
+      return std::nullopt;
+
+    SmallVector<cudaq::Device::Qubit> path;
+    for (auto node = dst.index;; node = parent[node]) {
+      path.push_back(cudaq::Device::Qubit(static_cast<unsigned>(node)));
+      if (node == src.index)
+        break;
+    }
+    std::reverse(path.begin(), path.end());
+    return path;
   }
 
   Value createIndexValue(OpBuilder &builder, Location loc,
@@ -906,6 +979,131 @@ struct MappingFunc : public cudaq::opt::impl::MappingFuncBase<MappingFunc> {
     return {};
   }
 
+  Value getStaticReferenceByIndex(const DenseMap<Value, unsigned> &staticRefs,
+                                  unsigned index) {
+    for (auto [ref, refIndex] : staticRefs)
+      if (refIndex == index)
+        return ref;
+    return {};
+  }
+
+  Value createConstantReferenceAt(OpBuilder &builder, Location loc,
+                                  const ReferenceAccess &lhsAccess,
+                                  const ReferenceAccess &rhsAccess,
+                                  const DenseMap<Value, unsigned> &staticRefs,
+                                  unsigned index) {
+    if (!lhsAccess.index.base && lhsAccess.index.offset >= 0 &&
+        static_cast<unsigned>(lhsAccess.index.offset) == index)
+      return lhsAccess.ref;
+    if (!rhsAccess.index.base && rhsAccess.index.offset >= 0 &&
+        static_cast<unsigned>(rhsAccess.index.offset) == index)
+      return rhsAccess.ref;
+
+    Value veq = lhsAccess.veq ? lhsAccess.veq : rhsAccess.veq;
+    if (veq)
+      return cudaq::quake::ExtractRefOp::create(
+          builder, loc, veq, static_cast<std::size_t>(index));
+
+    return getStaticReferenceByIndex(staticRefs, index);
+  }
+
+  LogicalResult insertReferenceRouteSwaps(Operation *op,
+                                          ArrayRef<Value> routeRefs) {
+    auto operands = cudaq::quake::getQuantumOperands(op);
+    auto results = cudaq::quake::getQuantumResults(op);
+    if (operands.size() != 2 || results.size() != 2)
+      return failure();
+
+    if (routeRefs.size() < 2)
+      return failure();
+    if (routeRefs.size() == 2)
+      return success();
+
+    auto routeDistance = routeRefs.size() - 1;
+    SmallVector<Value> wires(routeRefs.size());
+    wires[0] = operands[0];
+    wires[routeDistance] = operands[1];
+
+    auto loc = op->getLoc();
+    OpBuilder beforeBuilder(op);
+    for (unsigned i = 1; i < routeDistance; ++i)
+      wires[i] = cudaq::quake::UnwrapOp::create(
+          beforeBuilder, loc, operands[0].getType(), routeRefs[i]);
+
+    auto wireType = operands[0].getType();
+    for (unsigned i = routeDistance - 1; i > 0; --i) {
+      auto swap = cudaq::quake::SwapOp::create(
+          beforeBuilder, loc, TypeRange{wireType, wireType}, false,
+          ValueRange{}, ValueRange{}, ValueRange{wires[i], wires[i + 1]},
+          DenseBoolArrayAttr{});
+      wires[i] = swap.getResult(0);
+      wires[i + 1] = swap.getResult(1);
+    }
+
+    if (failed(cudaq::quake::setQuantumOperands(op, {wires[0], wires[1]})))
+      return failure();
+    wires[0] = results[0];
+    wires[1] = results[1];
+
+    OpBuilder afterBuilder(op->getContext());
+    afterBuilder.setInsertionPointAfter(op);
+    for (unsigned i = 1; i < routeDistance; ++i) {
+      auto swap = cudaq::quake::SwapOp::create(
+          afterBuilder, loc, TypeRange{wireType, wireType}, false, ValueRange{},
+          ValueRange{}, ValueRange{wires[i], wires[i + 1]},
+          DenseBoolArrayAttr{});
+      wires[i] = swap.getResult(0);
+      wires[i + 1] = swap.getResult(1);
+    }
+
+    auto lhsWrap = findWrap(results[0]);
+    auto rhsWrap = findWrap(results[1]);
+    if (!lhsWrap || !rhsWrap)
+      return failure();
+    lhsWrap.getWireValueMutable().assign(wires[0]);
+    rhsWrap.getWireValueMutable().assign(wires[routeDistance]);
+    for (unsigned i = 1; i < routeDistance; ++i)
+      cudaq::quake::WrapOp::create(afterBuilder, loc, wires[i], routeRefs[i]);
+
+    return success();
+  }
+
+  LogicalResult
+  routeStaticReferenceQlsTwoQubitOp(Operation *op, const cudaq::Device &device,
+                                    const DenseMap<Value, unsigned> &staticRefs,
+                                    const ReferenceAccess &lhsAccess,
+                                    const ReferenceAccess &rhsAccess,
+                                    unsigned numQubits) {
+    if (lhsAccess.index.base || rhsAccess.index.base)
+      return failure();
+    if (lhsAccess.index.offset < 0 || rhsAccess.index.offset < 0)
+      return failure();
+
+    auto lhsIndex = static_cast<unsigned>(lhsAccess.index.offset);
+    auto rhsIndex = static_cast<unsigned>(rhsAccess.index.offset);
+    if (lhsIndex >= numQubits || rhsIndex >= numQubits ||
+        lhsIndex >= device.getNumQubits() || rhsIndex >= device.getNumQubits())
+      return failure();
+
+    auto path = getShortestDevicePath(device, cudaq::Device::Qubit(lhsIndex),
+                                      cudaq::Device::Qubit(rhsIndex));
+    if (!path || path->size() < 2)
+      return failure();
+
+    OpBuilder builder(op);
+    SmallVector<Value> routeRefs;
+    routeRefs.reserve(path->size());
+    for (auto qubit : *path) {
+      auto ref = createConstantReferenceAt(builder, op->getLoc(), lhsAccess,
+                                           rhsAccess, staticRefs, qubit.index);
+      if (!ref)
+        return failure();
+      routeRefs.push_back(ref);
+    }
+
+    return insertReferenceRouteSwaps(op, routeRefs);
+  }
+
   LogicalResult
   routeReferenceQlsTwoQubitOp(Operation *op, const cudaq::Device &device,
                               const DenseMap<Value, unsigned> &staticRefs,
@@ -932,12 +1130,9 @@ struct MappingFunc : public cudaq::opt::impl::MappingFuncBase<MappingFunc> {
       return failure();
     auto absDistance = static_cast<unsigned>(std::llabs(*distance));
 
-    if (!lhsAccess->index.base) {
-      auto lhsQ = cudaq::Device::Qubit(lhsAccess->index.offset);
-      auto rhsQ = cudaq::Device::Qubit(rhsAccess->index.offset);
-      if (device.areConnected(lhsQ, rhsQ))
-        return success();
-    }
+    if (!lhsAccess->index.base)
+      return routeStaticReferenceQlsTwoQubitOp(
+          op, device, staticRefs, *lhsAccess, *rhsAccess, numQubits);
 
     auto lhsRange = getReferenceIndexRange(*lhsAccess, numQubits);
     auto rhsRange = getReferenceIndexRange(*rhsAccess, numQubits);
@@ -952,11 +1147,8 @@ struct MappingFunc : public cudaq::opt::impl::MappingFuncBase<MappingFunc> {
       return success();
 
     SmallVector<Value> refs(absDistance + 1);
-    SmallVector<Value> wires(absDistance + 1);
     refs[0] = lhsAccess->ref;
     refs[absDistance] = rhsAccess->ref;
-    wires[0] = operands[0];
-    wires[absDistance] = operands[1];
 
     auto loc = op->getLoc();
     OpBuilder beforeBuilder(op);
@@ -966,52 +1158,98 @@ struct MappingFunc : public cudaq::opt::impl::MappingFuncBase<MappingFunc> {
                                   lhsAccess->index.offset + sign * i);
       if (!refs[i])
         return failure();
-      wires[i] = cudaq::quake::UnwrapOp::create(beforeBuilder, loc,
-                                                operands[0].getType(), refs[i]);
     }
 
-    auto wireType = operands[0].getType();
-    for (unsigned i = absDistance - 1; i > 0; --i) {
-      auto swap = cudaq::quake::SwapOp::create(
-          beforeBuilder, loc, TypeRange{wireType, wireType}, false,
-          ValueRange{}, ValueRange{}, ValueRange{wires[i], wires[i + 1]},
-          DenseBoolArrayAttr{});
-      wires[i] = swap.getResult(0);
-      wires[i + 1] = swap.getResult(1);
-    }
-
-    if (failed(cudaq::quake::setQuantumOperands(op, {wires[0], wires[1]})))
-      return failure();
-    wires[0] = results[0];
-    wires[1] = results[1];
-
-    OpBuilder afterBuilder(op->getContext());
-    afterBuilder.setInsertionPointAfter(op);
-    for (unsigned i = 1; i < absDistance; ++i) {
-      auto swap = cudaq::quake::SwapOp::create(
-          afterBuilder, loc, TypeRange{wireType, wireType}, false, ValueRange{},
-          ValueRange{}, ValueRange{wires[i], wires[i + 1]},
-          DenseBoolArrayAttr{});
-      wires[i] = swap.getResult(0);
-      wires[i + 1] = swap.getResult(1);
-    }
-
-    auto lhsWrap = findWrap(results[0]);
-    auto rhsWrap = findWrap(results[1]);
-    if (!lhsWrap || !rhsWrap)
-      return failure();
-    lhsWrap.getWireValueMutable().assign(wires[0]);
-    rhsWrap.getWireValueMutable().assign(wires[absDistance]);
-    for (unsigned i = 1; i < absDistance; ++i)
-      cudaq::quake::WrapOp::create(afterBuilder, loc, wires[i], refs[i]);
-
-    return success();
+    return insertReferenceRouteSwaps(op, refs);
   }
 
-  LogicalResult tryReferenceQlsMapping(func::FuncOp func,
-                                       const cudaq::Device &device) {
+  void collectStaticLoopInductionDependencies(
+      Value value, llvm::SmallPtrSetImpl<Operation *> &loops,
+      llvm::SmallPtrSetImpl<Value> &visited) {
+    if (!value || !visited.insert(value).second)
+      return;
+
+    if (auto loop = getStaticLoopInductionOwner(value)) {
+      loops.insert(loop.getOperation());
+      return;
+    }
+
+    auto *def = value.getDefiningOp();
+    if (!def)
+      return;
+
+    for (auto operand : def->getOperands())
+      collectStaticLoopInductionDependencies(operand, loops, visited);
+  }
+
+  void collectReferenceIndexLoops(Value ref,
+                                  llvm::SmallPtrSetImpl<Operation *> &loops) {
+    auto extract = ref.getDefiningOp<cudaq::quake::ExtractRefOp>();
+    if (!extract || extract.hasConstantIndex())
+      return;
+
+    llvm::SmallPtrSet<Value, 16> visited;
+    collectStaticLoopInductionDependencies(extract.getIndex(), loops, visited);
+  }
+
+  bool selectivelyUnrollReferenceIndexLoops(func::FuncOp func) {
+    llvm::SmallPtrSet<Operation *, 8> loopsToUnroll;
+
+    func.walk([&](cudaq::quake::OperatorInterface gate) {
+      auto controlCount = getSingleReferenceOperandCount(gate.getControls());
+      auto targetCount = getSingleReferenceOperandCount(gate.getTargets());
+      if (!controlCount || !targetCount || *controlCount + *targetCount != 2)
+        return WalkResult::advance();
+
+      auto operands = cudaq::quake::getQuantumOperands(gate);
+      if (operands.size() != 2)
+        return WalkResult::advance();
+
+      auto lhsUnwrap = operands[0].getDefiningOp<cudaq::quake::UnwrapOp>();
+      auto rhsUnwrap = operands[1].getDefiningOp<cudaq::quake::UnwrapOp>();
+      if (!lhsUnwrap || !rhsUnwrap)
+        return WalkResult::advance();
+
+      collectReferenceIndexLoops(lhsUnwrap.getRefValue(), loopsToUnroll);
+      collectReferenceIndexLoops(rhsUnwrap.getRefValue(), loopsToUnroll);
+      return WalkResult::advance();
+    });
+
+    if (loopsToUnroll.empty())
+      return false;
+
+    auto *ctx = func.getContext();
+    RewritePatternSet patterns(ctx);
+    for (auto *dialect : ctx->getLoadedDialects())
+      dialect->getCanonicalizationPatterns(patterns);
+    for (RegisteredOperationName op : ctx->getRegisteredOperations())
+      op.getCanonicalizationPatterns(patterns, ctx);
+
+    unsigned progress = 0;
+    patterns.insert<UnrollCountedLoop>(
+        ctx, /*threshold=*/1024, /*signalFailure=*/false,
+        /*allowBreak=*/false, progress,
+        [loopsToUnroll](cudaq::cc::LoopOp loop) {
+          return loopsToUnroll.contains(loop.getOperation());
+        });
+
+    FrozenRewritePatternSet frozen(std::move(patterns));
+    bool changed = false;
+    do {
+      progress = 0;
+      (void)applyPatternsGreedily(func, frozen);
+      changed |= progress != 0;
+    } while (progress);
+
+    return changed;
+  }
+
+  LogicalResult tryReferenceQlsMappingInPlace(func::FuncOp func,
+                                              const cudaq::Device &device) {
     auto numQubits = getStaticReferenceQubitCount(func);
     if (!numQubits)
+      return failure();
+    if (*numQubits == 0 || *numQubits > device.getNumQubits())
       return failure();
 
     DenseMap<Value, unsigned> staticRefs;
@@ -1065,11 +1303,29 @@ struct MappingFunc : public cudaq::opt::impl::MappingFuncBase<MappingFunc> {
       return failure();
     if (!hasQuantum)
       return failure();
-    if (*numQubits == 0 || *numQubits > device.getNumQubits())
-      return failure();
-
     setIdentityMappingAttrs(func, *numQubits, numMeasurements);
     return success();
+  }
+
+  LogicalResult tryReferenceQlsMapping(func::FuncOp func,
+                                       const cudaq::Device &device,
+                                       bool allowSelectiveUnroll = true) {
+    if (!allowSelectiveUnroll)
+      return tryReferenceQlsMappingInPlace(func, device);
+
+    auto trial = cast<func::FuncOp>(func->clone());
+    auto trialResult = tryReferenceQlsMappingInPlace(trial, device);
+    trial->destroy();
+    if (succeeded(trialResult))
+      return tryReferenceQlsMappingInPlace(func, device);
+
+    if (!selectivelyUnrollReferenceIndexLoops(func))
+      return failure();
+
+    if (succeeded(tryReferenceQlsMapping(func, device,
+                                         /*allowSelectiveUnroll=*/false)))
+      return success();
+    return failure();
   }
 
   void runOnOperation() override {
