@@ -20,6 +20,7 @@ public:
   ~DefaultQPU() override;
 
   void enqueue(QuantumTask &task) override;
+  void onRandomSeedSet(std::size_t seed) override;
 
   KernelThunkResultType unifiedLaunchModule(const cudaq::AnyModule &module,
                                             cudaq::KernelArgs args) override;
@@ -36,15 +37,46 @@ public:
                               const CompiledModule &module,
                               KernelArgs args) override;
 
+  run_result launchKernel(const run_policy &policy,
+                          const CompiledModule &module,
+                          KernelArgs args) override;
+
+  async_run_policy::result_type launchKernel(const async_run_policy &policy,
+                                             const CompiledModule &module,
+                                             KernelArgs args) override;
+
+  msm_dimensions launchKernel(const msm_size_policy &policy,
+                              const CompiledModule &module,
+                              KernelArgs args) override;
+
+  msm_result launchKernel(const msm_policy &policy,
+                          const CompiledModule &module,
+                          KernelArgs args) override;
+
   async_observe_result launchKernel(const async_observe_policy &policy,
                                     const CompiledModule &module,
                                     KernelArgs args) override;
 
+  dem_result launchKernel(const dem_policy &policy,
+                          const CompiledModule &module,
+                          KernelArgs args) override;
+
+  ptsbe::sample_policy::result_type
+  launchKernel(const ptsbe::sample_policy &policy, const CompiledModule &module,
+               KernelArgs args) override;
+
+  using QPU::getCompileTarget;
   std::unique_ptr<CompileTarget>
   getCompileTarget(const sample_policy &policy) override;
 
   std::unique_ptr<CompileTarget>
   getCompileTarget(const observe_policy &policy) override;
+
+  std::unique_ptr<CompileTarget>
+  getCompileTarget(const run_policy &policy) override;
+
+  std::unique_ptr<CompileTarget>
+  getCompileTarget(const dem_policy &policy) override;
 
   std::unique_ptr<CompileTarget>
   getCompileTarget(const other_policies &policy,

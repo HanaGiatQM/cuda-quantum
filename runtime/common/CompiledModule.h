@@ -191,7 +191,6 @@ public:
     std::vector<std::size_t> reorderIdx;
     /// Whether the kernel has conditional feedback on measure results.
     bool hasConditionalsOnMeasureResults = false;
-    // TODO: Add hash of target to check against for cache reusability
   };
 
   // --- Queries ---

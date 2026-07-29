@@ -6,11 +6,19 @@
 # the terms of the Apache License 2.0 which accompanies this distribution.     #
 # ============================================================================ #
 
-cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
+cmake_minimum_required(VERSION 4.0 FATAL_ERROR)
 
 include(FetchContent)
 
 string(COMPARE EQUAL "${CMAKE_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}" CUDAQ_REALTIME_STANDALONE_BUILD)
+
+if(NOT CUDAQ_REALTIME_STANDALONE_BUILD)
+  # The parent CUDA-Q build enables CMAKE_COMPILE_WARNING_AS_ERROR globally
+  # (rendered as `-Werror all-warnings` for nvcc), but the standalone realtime
+  # build does not. Follow the standalone warning policy for realtime targets
+  # in the combined build as well.
+  set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
+endif()
 
 if(CUDAQ_REALTIME_STANDALONE_BUILD)
   # Set a default build type if none was specified. Must set this before
@@ -68,34 +76,6 @@ if(CUDAQ_REALTIME_STANDALONE_BUILD)
   list(APPEND _host_compiler_opts_list "-fPIC")
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND
-   CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
-    # nvcc cannot parse the GCC BF16 intrinsic headers exposed through
-    # <immintrin.h> on the CI toolchains. This only applies from GCC 13:
-    # GCC 13 switched the AVX512BF16 intrinsics to the `__bf16` builtin type
-    # (GCC 12 still used the parseable `__bfloat16` typedef) and introduced
-    # <avxneconvertintrin.h>, which does not exist on GCC 12.
-    list(APPEND _host_compiler_opts_list
-      "-D_AVX512BF16INTRIN_H_INCLUDED"
-      "-D_AVX512BF16VLINTRIN_H_INCLUDED"
-      "-D_AVXNECONVERTINTRIN_H_INCLUDED")
-  endif()
-
-  if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
-    # -mno-amx-tile alone is insufficient: the AMX intrinsic headers use
-    # #pragma GCC target("amx-*") which re-enables the builtins that nvcc
-    # cannot parse. Pre-define the include guards to skip those headers.
-    list(APPEND _host_compiler_opts_list
-      "-mno-amx-tile"
-      "-D_AMXTILEINTRIN_H_INCLUDED"
-      "-D_AMXBF16INTRIN_H_INCLUDED"
-      "-D_AMXINT8INTRIN_H_INCLUDED"
-      "-D_AMXFP16INTRIN_H_INCLUDED"
-      "-D_AMXCOMPLEXINTRIN_H_INCLUDED")
-  endif()
-endif()
-
 list(JOIN _host_compiler_opts_list "," _host_compiler_opts)
 
 # Check for CUDA Support (ref: cuda-quantum/CMakeLists.txt)
@@ -134,14 +114,11 @@ if(CUDAQ_REALTIME_STANDALONE_BUILD)
       endif()
     endif()
     CUDA_get_gencode_args(CUDA_gencode_flags ${CUDA_TARGET_ARCHS})
-    # Keep realtime CUDA sources on C++17. nvcc's C++20 frontend can hit an
-    # internal compiler error in libstdc++ headers when compiling the standalone
-    # realtime tests, including test_host_dispatcher.cu, on the CI toolchain.
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -shared -std=c++17 ${CUDA_gencode_flags} --compiler-options ${_host_compiler_opts}")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -shared -std=c++20 ${CUDA_gencode_flags} --compiler-options ${_host_compiler_opts}")
 
     enable_language(CUDA)
     set(CUDA_FOUND TRUE)
-    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED TRUE)
     message(STATUS "Cuda language found.")
   endif()
@@ -166,37 +143,32 @@ endif()
 
 add_subdirectory(lib)
 
-if (CUDA_FOUND)
-  configure_package_config_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cudaq-realtime-config.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/cmake/cudaq-realtime-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudaq-realtime)
+# Install the export set and package config unconditionally: members of
+# cudaq-realtime-targets exist on CUDA-less configures too (the UDP transport
+# is always built), and CMake silently installs an orphaned archive if a
+# target joins an export set that is never itself installed. The config file
+# only requires CUDAToolkit when this build had CUDA (see the @CUDA_FOUND@
+# substitution in cudaq-realtime-config.cmake.in).
+configure_package_config_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cudaq-realtime-config.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/cmake/cudaq-realtime-config.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudaq-realtime)
 
-  install(EXPORT cudaq-realtime-targets
-    FILE cudaq-realtime-targets.cmake
-    NAMESPACE cudaq::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudaq-realtime)
+install(EXPORT cudaq-realtime-targets
+  FILE cudaq-realtime-targets.cmake
+  NAMESPACE cudaq::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudaq-realtime)
 
-  install(FILES
-    ${CMAKE_CURRENT_BINARY_DIR}/cmake/cudaq-realtime-config.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudaq-realtime)
-endif()
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/cmake/cudaq-realtime-config.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/cudaq-realtime)
 
 if (CUDAQ_REALTIME_BUILD_EXAMPLES)
   message(STATUS "RoCE/DOCA examples removed for RPC dispatch workflow.")
 endif()
 
 if (CUDAQ_REALTIME_BUILD_TESTS)
-  add_custom_target(CudaqRealtimeUnitTests)
   include(CTest)
-
-  add_custom_target(run_tests
-    COMMAND ${CMAKE_COMMAND} -E env 
-            PYTHONPATH="${CUDAQ_INSTALL_DIR}:${CMAKE_BINARY_DIR}/python"
-            ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS CudaqRealtimeUnitTests
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-  )
   add_subdirectory(unittests)
 endif()
 

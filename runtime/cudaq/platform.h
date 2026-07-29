@@ -57,6 +57,10 @@ getDefaultCompileTarget(const sample_policy &policy);
 std::unique_ptr<cudaq::CompileTarget>
 getDefaultCompileTarget(const observe_policy &policy);
 std::unique_ptr<cudaq::CompileTarget>
+getDefaultCompileTarget(const run_policy &policy);
+std::unique_ptr<cudaq::CompileTarget>
+getDefaultCompileTarget(const dem_policy &policy);
+std::unique_ptr<cudaq::CompileTarget>
 getDefaultCompileTarget(const other_policies &policy,
                         ExecutionContext *context);
 

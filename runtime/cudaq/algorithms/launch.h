@@ -12,12 +12,14 @@
 #include "common/CompiledModule.h"
 #include "common/ExecutionContext.h"
 #include "common/KernelArgs.h"
+#include "cudaq/algorithms/msm/policy.h"
 #include "cudaq/platform.h"
 #include "cudaq/platform/qpu.h"
 #include "cudaq/qis/execution_manager.h"
 #include "cudaq/runtime/logger/logger.h"
 #include "cudaq/utils/cudaq_utils.h"
 #include <stdexcept>
+#include <utility>
 #include <variant>
 
 #ifndef CUDAQ_DISABLE_JIT_COMPILER
@@ -25,7 +27,7 @@ namespace cudaq_internal::compiler {
 cudaq::CompiledModule
 compileModule(std::unique_ptr<cudaq::CompileTarget> target,
               const cudaq::SourceModule &src, cudaq::KernelArgs args,
-              bool isEntryPoint = true);
+              bool isEntryPoint);
 } // namespace cudaq_internal::compiler
 #endif
 
@@ -78,7 +80,8 @@ auto launch(const Policy &policy, std::size_t qpu_id, ExecutionContext &ctx,
         target = cudaq::get_compile_target(policy);
       }
       compiled = cudaq_internal::compiler::compileModule(std::move(target),
-                                                         *source, args);
+                                                         *source, args,
+                                                         /*isEntryPoint=*/true);
 #endif
     } else {
       CUDAQ_INFO("Found compiled module. Skipping compilation.");
@@ -103,4 +106,36 @@ auto launch(const Policy &policy, std::size_t qpu_id, ExecutionContext &ctx,
   return result;
 }
 } // namespace detail
+
+/// @brief Execute the given function with an MSM size policy.
+template <typename Callable, typename... Args>
+msm_dimensions launch(msm_size_policy policy, Callable &&f, Args &&...args) {
+  auto &platform = get_platform();
+  ExecutionContext ctx(msm_size_policy::name);
+  const size_t qpu_id = 0;
+  ctx.qpuId = qpu_id;
+  policy.kernelName = cudaq::getKernelName(f);
+  ctx.kernelName = policy.kernelName;
+  policy.noiseModel = platform.get_noise(qpu_id);
+  ctx.noiseModel = policy.noiseModel;
+  return detail::launch(policy, qpu_id, ctx, platform,
+                        std::forward<Callable>(f), std::forward<Args>(args)...);
+}
+
+/// @brief Execute the given function with an MSM policy.
+template <typename Callable, typename... Args>
+msm_result launch(msm_policy policy, Callable &&f, Args &&...args) {
+  auto &platform = get_platform();
+  ExecutionContext ctx(msm_policy::name);
+  const size_t qpu_id = 0;
+  ctx.qpuId = qpu_id;
+  policy.kernelName = cudaq::getKernelName(f);
+  ctx.kernelName = policy.kernelName;
+  policy.noiseModel = platform.get_noise(qpu_id);
+  ctx.noiseModel = policy.noiseModel;
+  ctx.msm_dimensions = policy.dimensions;
+  return detail::launch(policy, qpu_id, ctx, platform,
+                        std::forward<Callable>(f), std::forward<Args>(args)...);
+}
+
 } // namespace cudaq
